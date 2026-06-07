@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify, send_from_directory
-import joblib
 import numpy as np
 import os
 import base64
@@ -7,35 +6,84 @@ import io
 
 app = Flask(__name__, static_folder='static')
 
-# --- Define predict_rps so the pkl can unpickle correctly ---
-def predict_rps(image_array):
-    """
-    Stub predict function stored in the pkl.
-    The actual prediction logic lives below in /scan.
-    This definition satisfies the pickle reference to __main__.predict_rps.
-    """
-    pass
+# ---------------------------------------------------------------------------
+# MediaPipe hand landmark setup
+# ---------------------------------------------------------------------------
+import mediapipe as mp
 
-# Load the model (which holds a reference to predict_rps defined above)
-import __main__
-__main__.predict_rps = predict_rps
-model = joblib.load('rps_model.pkl')
+mp_hands = mp.solutions.hands
+hands_detector = mp_hands.Hands(
+    static_image_mode=True,
+    max_num_hands=1,
+    min_detection_confidence=0.5,
+)
+
+# ---------------------------------------------------------------------------
+# RPS classification from landmarks
+# ---------------------------------------------------------------------------
+
+def _finger_extended(landmarks, tip_id, pip_id):
+    """Return True if a finger is extended (tip above PIP joint in image coords)."""
+    return landmarks[tip_id].y < landmarks[pip_id].y
 
 
-def preprocess_image(image_bytes):
+def classify_rps(landmarks):
     """
-    Resize and flatten an uploaded image into a feature vector
-    compatible with the model. Tries PIL first, falls back to numpy.
-    """
-    try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        img = img.resize((64, 64))
-        arr = np.array(img, dtype=np.float32) / 255.0
-        return arr.flatten()
-    except Exception as e:
-        raise ValueError(f"Could not process image: {e}")
+    Classify Rock / Paper / Scissors from 21 MediaPipe hand landmarks.
 
+    Finger tip / PIP landmark indices:
+      Index  : tip=8,  pip=6
+      Middle : tip=12, pip=10
+      Ring   : tip=16, pip=14
+      Pinky  : tip=20, pip=18
+      Thumb  : tip=4,  ip=3  (uses x-axis comparison)
+
+    Returns (label, confidence_pct).
+    """
+    lm = landmarks
+
+    index  = _finger_extended(lm, 8,  6)
+    middle = _finger_extended(lm, 12, 10)
+    ring   = _finger_extended(lm, 16, 14)
+    pinky  = _finger_extended(lm, 20, 18)
+
+    # Thumb: compare x position of tip vs IP joint (works for right hand facing camera)
+    thumb = abs(lm[4].x - lm[3].x) > 0.04
+
+    fingers_up = sum([index, middle, ring, pinky])
+
+    # --- Rules ---
+    if fingers_up == 0:                          # all fingers curled
+        label, conf = 'Rock', 92
+    elif fingers_up == 4:                        # all fingers open
+        label, conf = 'Paper', 95
+    elif index and middle and not ring and not pinky:  # V sign
+        label, conf = 'Scissors', 93
+    elif index and not middle and not ring and not pinky:  # pointing
+        label, conf = 'Scissors', 75
+    elif fingers_up >= 3:
+        label, conf = 'Paper', 70
+    elif fingers_up == 1:
+        label, conf = 'Rock', 65
+    else:
+        label, conf = 'Rock', 55   # fallback
+
+    return label, conf
+
+
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
+
+def load_rgb_image(image_bytes):
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    return np.array(img, dtype=np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.route('/')
 def index():
@@ -44,7 +92,6 @@ def index():
 
 @app.route('/scan', methods=['POST'])
 def scan():
-    # Accept either a file upload or a base64 data URL from the webcam
     image_bytes = None
 
     if 'file' in request.files and request.files['file'].filename:
@@ -52,42 +99,30 @@ def scan():
     elif request.is_json:
         data = request.get_json()
         if 'image' in data:
-            # Strip data URL header if present
             b64 = data['image'].split(',')[-1]
             image_bytes = base64.b64decode(b64)
-    
+
     if image_bytes is None:
         return jsonify({'error': 'No image provided'}), 400
 
     try:
-        features = preprocess_image(image_bytes)
-        X = np.array([features], dtype=np.float32)
-
-        # Use the loaded pkl object if it's a sklearn estimator,
-        # otherwise call it directly as a function
-        if hasattr(model, 'predict'):
-            pred_raw = model.predict(X)[0]
-            prob = model.predict_proba(X)[0] if hasattr(model, 'predict_proba') else None
-        else:
-            pred_raw = model(X)
-            prob = None
-
-        # Map numeric or string prediction to RPS label
-        label_map = {0: 'Rock', 1: 'Paper', 2: 'Scissors',
-                     'rock': 'Rock', 'paper': 'Paper', 'scissors': 'Scissors',
-                     'Rock': 'Rock', 'Paper': 'Paper', 'Scissors': 'Scissors'}
-        label = label_map.get(pred_raw, str(pred_raw))
-        confidence = int(max(prob) * 100) if prob is not None else None
-
-        return jsonify({
-            'prediction': str(pred_raw),
-            'label': label,
-            'confidence': confidence,
-            'emoji': {'Rock': '✊', 'Paper': '✋', 'Scissors': '✌️'}.get(label, '❓')
-        })
-
+        img_rgb = load_rgb_image(image_bytes)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f'Could not decode image: {e}'}), 400
+
+    result = hands_detector.process(img_rgb)
+
+    if not result.multi_hand_landmarks:
+        return jsonify({'error': 'No hand detected — make sure your hand is clearly visible'}), 200
+
+    landmarks = result.multi_hand_landmarks[0].landmark
+    label, confidence = classify_rps(landmarks)
+
+    return jsonify({
+        'label': label,
+        'confidence': confidence,
+        'emoji': {'Rock': '✊', 'Paper': '✋', 'Scissors': '✌️'}[label],
+    })
 
 
 if __name__ == '__main__':
